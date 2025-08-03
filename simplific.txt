@@ -1,0 +1,229 @@
+import re
+from collections import defaultdict, deque
+
+class CFG:
+    def __init__(self, start, productions):
+        self.start = start
+        self.productions = defaultdict(list)
+        for head, bodies in productions.items():
+            for body in bodies:
+                symbols = body.split() if ' ' in body else list(body)
+                self.productions[head].append(tuple(symbols))
+        self.nonterminals = list(self.productions.keys())
+        self.terminals = {sym for heads in self.productions.values() for prod in heads for sym in prod if sym not in self.nonterminals}
+
+    @staticmethod
+    def parse(text):
+        productions = {}
+        start = None
+        for line in text.strip().splitlines():
+            head, rhs = line.split('->')
+            head = head.strip()
+            if start is None:
+                start = head
+            bodies = [alt.strip() for alt in rhs.split('|')]
+            productions[head] = bodies
+        return CFG(start, productions)
+
+    def remove_unreachable(self):
+        reachable = {self.start}
+        queue = deque([self.start])
+        while queue:
+            head = queue.popleft()
+            for prod in self.productions.get(head, []):
+                for sym in prod:
+                    if sym in self.productions and sym not in reachable:
+                        reachable.add(sym)
+                        queue.append(sym)
+        self.productions = {h: b for h, b in self.productions.items() if h in reachable}
+        self.nonterminals = [h for h in self.nonterminals if h in reachable]
+
+    def remove_nonproductive(self):
+        productive = set()
+        changed = True
+        while changed:
+            changed = False
+            for head, bodies in self.productions.items():
+                if head not in productive:
+                    for prod in bodies:
+                        if all(sym in productive or sym not in self.productions for sym in prod):
+                            productive.add(head)
+                            changed = True
+                            break
+        self.productions = {h: [b for b in bodies if all(sym in productive or sym not in self.productions for sym in b)]
+                            for h, bodies in self.productions.items() if h in productive}
+        self.nonterminals = [h for h in self.nonterminals if h in productive]
+
+    def remove_useless(self):
+        self.remove_unreachable()
+        self.remove_nonproductive()
+
+    def remove_epsilon(self):
+        nullable = set()
+        changed = True
+        while changed:
+            changed = False
+            for head, bodies in self.productions.items():
+                for prod in bodies:
+                    if all(sym in nullable or sym == 'ε' for sym in prod):
+                        if head not in nullable:
+                            nullable.add(head)
+                            changed = True
+        new_prods = defaultdict(list)
+        for head, bodies in self.productions.items():
+            for prod in bodies:
+                indexes = [i for i, s in enumerate(prod) if s in nullable]
+                for mask in range(1 << len(indexes)):
+                    new_prod = list(prod)
+                    for j, idx in enumerate(indexes):
+                        if mask & (1 << j):
+                            new_prod[idx] = None
+                    new = tuple(s for s in new_prod if s)
+                    if new:
+                        new_prods[head].append(new)
+        if self.start in nullable:
+            new_prods[self.start].append(())
+        self.productions = new_prods
+
+    def remove_unit(self):
+        unit_pairs = {(nt, nt) for nt in self.nonterminals}
+        changed = True
+        while changed:
+            changed = False
+            for head, bodies in self.productions.items():
+                for prod in bodies:
+                    if len(prod) == 1 and prod[0] in self.nonterminals:
+                        pair = (head, prod[0])
+                        if pair not in unit_pairs:
+                            unit_pairs.add(pair)
+                            changed = True
+        new_prods = defaultdict(list)
+        for a, b in unit_pairs:
+            for prod in self.productions[b]:
+                if not (len(prod) == 1 and prod[0] in self.nonterminals):
+                    new_prods[a].append(prod)
+        self.productions = new_prods
+
+    def to_chomsky(self):
+        self.remove_epsilon()
+        self.remove_unit()
+        new_prods = defaultdict(list)
+        cnt = 0
+        for head, bodies in self.productions.items():
+            for prod in bodies:
+                if len(prod) <= 2:
+                    new_prods[head].append(prod)
+                else:
+                    cur = prod
+                    prev = head
+                    while len(cur) > 2:
+                        cnt += 1
+                        nt = f"X{cnt}"
+                        self.nonterminals.append(nt)
+                        new_prods[prev].append((cur[0], nt))
+                        prev = nt
+                        cur = cur[1:]
+                    new_prods[prev].append(cur)
+        term_map = {}
+        for head, bodies in list(new_prods.items()):
+            updated = []
+            for prod in bodies:
+                if len(prod) == 2:
+                    new_pair = []
+                    for sym in prod:
+                        if sym in self.terminals:
+                            if sym not in term_map:
+                                cnt += 1
+                                name = f"T{cnt}"
+                                self.nonterminals.append(name)
+                                term_map[sym] = name
+                            new_pair.append(term_map[sym])
+                        else:
+                            new_pair.append(sym)
+                    updated.append(tuple(new_pair))
+                else:
+                    updated.append(prod)
+            new_prods[head] = updated
+        for t, nt in term_map.items():
+            new_prods[nt] = [(t,)]
+        self.productions = new_prods
+
+    def remove_left_recursion(self):
+        for i, Ai in enumerate(self.nonterminals):
+            for Aj in self.nonterminals[:i]:
+                new_bodies = []
+                for prod in self.productions[Ai]:
+                    if prod and prod[0] == Aj:
+                        for beta in self.productions[Aj]:
+                            new_bodies.append(beta + prod[1:])
+                    else:
+                        new_bodies.append(prod)
+                self.productions[Ai] = new_bodies
+            recursive = [p for p in self.productions[Ai] if p and p[0] == Ai]
+            nonrec = [p for p in self.productions[Ai] if not (p and p[0] == Ai)]
+            if recursive:
+                Ai_prime = Ai + "_R"
+                self.nonterminals.append(Ai_prime)
+                self.productions[Ai] = [p + (Ai_prime,) for p in nonrec]
+                self.productions[Ai_prime] = [p[1:] + (Ai_prime,) for p in recursive] + [()]
+
+    def left_factor(self):
+        for head in list(self.productions.keys()):
+            groups = defaultdict(list)
+            for prod in self.productions[head]:
+                key = prod[0] if prod else ''
+                groups[key].append(prod)
+            new_list = []
+            for key, prods in groups.items():
+                if len(prods) > 1 and key:
+                    new_nt = f"{head}_{key}"
+                    self.nonterminals.append(new_nt)
+                    new_list.append((key, new_nt))
+                    suffixes = [p[1:] if len(p) > 1 else () for p in prods]
+                    self.productions[new_nt] = suffixes
+                else:
+                    new_list.extend(prods)
+            self.productions[head] = new_list
+
+    def to_greibach(self):
+        self.remove_left_recursion()
+        order = self.nonterminals
+        for i, Ai in enumerate(order):
+            new_bodies = []
+            for prod in self.productions[Ai]:
+                if prod and prod[0] in order[:i]:
+                    Aj = prod[0]
+                    for gamma in self.productions[Aj]:
+                        new_bodies.append(gamma + prod[1:])
+                else:
+                    new_bodies.append(prod)
+            self.productions[Ai] = new_bodies
+            updated = []
+            for prod in self.productions[Ai]:
+                if prod and prod[0] in self.productions:
+                    continue
+                updated.append(prod)
+            self.productions[Ai] = updated
+
+if __name__ == "__main__":
+    text = """
+    S -> a A a | b B v
+    A -> a | a A
+    B -> b
+    """
+    cfg = CFG.parse(text)
+    print("Original:", cfg.productions)
+    cfg.remove_useless()
+    cfg.remove_epsilon()
+    cfg.remove_unit()
+    print("Simplificada:", cfg.productions)
+    cfg_cf = CFG.parse(text)
+    cfg_cf.to_chomsky()
+    print("Chomsky:", cfg_cf.productions)
+    cfg_g = CFG.parse(text)
+    cfg_g.to_greibach()
+    print("Greibach:", cfg_g.productions)
+    cfg_f = CFG.parse(text)
+    cfg_f.left_factor()
+    cfg_f.remove_left_recursion()
+    print("Fatorada+Sem Recursão:", cfg_f.productions)
